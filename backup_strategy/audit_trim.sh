@@ -3,60 +3,95 @@
 # --- CONFIGURATION ---
 CONTAINER_NAME="postgres14"
 DB_USER="myuser"
+DB_PASS="mypassword"
 DB_NAME="mydatabase"
+TABLE_NAME="audit_logs"
+
+# RETAIN POLICY: How many rows to keep in live DB and files on Server B
+KEEP_ROWS=300000 
+KEEP_BACKUPS=10
+
+TEMP_TABLE="audit_logs_snapshot"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="/home/vagrant/logs/audit_purge.log"
-BACKUP_PATH="/home/vagrant/backups/latest_100k_snapshot_$TIMESTAMP.sql.gz"
+BACKUP_PATH="/home/vagrant/backups/audit_recent_$TIMESTAMP.sql.gz"
 
-# REMOTE INFO (Only for the 100k New Logs)
+# REMOTE INFO
 REMOTE_USER="vagrant"
 REMOTE_HOST="192.168.56.12"
 REMOTE_DIR="/home/vagrant/backups_from_server_a/audit_recent_snapshots"
 
-# --- LOCAL SETUP ---
-mkdir -p /home/vagrant/backups || true
-mkdir -p /home/vagrant/logs || true
-# Captures all output and errors to the log file
+# --- SAFETY SETTINGS ---
+set -o pipefail
+set +e 
+
+# Ensure local directories exist
+mkdir -p /home/vagrant/backups /home/vagrant/logs
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+# --- CLEANUP TRAP ---
+cleanup() {
+    echo "-----------------------------------------------------"
+    echo "Finalizing/Cleanup: $(date)"
+    docker exec -e PGPASSWORD="$DB_PASS" $CONTAINER_NAME psql -U $DB_USER -d $DB_NAME -c "DROP TABLE IF EXISTS $TEMP_TABLE;" || true
+    [ -f "$BACKUP_PATH" ] && rm -f "$BACKUP_PATH"
+    echo "Cleanup complete."
+}
+trap cleanup EXIT
+
 echo "-----------------------------------------------------"
-echo "PURGE & RECENT SNAPSHOT START: $(date)"
+echo "SQL BACKUP & PURGE START: $(date)"
 echo "-----------------------------------------------------"
 
-# 1. Calculate the Threshold (Keep latest 100,000)
-MAX_ID=$(docker exec $CONTAINER_NAME psql -U $DB_USER -d $DB_NAME -t -c "SELECT max(id) FROM audit_logs;")
-MAX_ID=$(echo $MAX_ID | xargs)
-THRESHOLD_ID=$((MAX_ID - 100000))
+# 1. CALCULATE THRESHOLD
+echo "Calculating Max ID from $TABLE_NAME..."
+MAX_ID=$(docker exec -e PGPASSWORD="$DB_PASS" $CONTAINER_NAME psql -U $DB_USER -d $DB_NAME -t -c "SELECT max(id) FROM $TABLE_NAME;")
+EXIT_CODE=$?
+MAX_ID=$(echo "$MAX_ID" | xargs)
 
-if [ $THRESHOLD_ID -gt 0 ]; then
-    echo "Current Max ID: $MAX_ID. Threshold: $THRESHOLD_ID"
-
-    # 2. STEP 1: Backup ONLY the LATEST 100,000 logs
-    echo "Backing up latest 100,000 logs (ID >= $THRESHOLD_ID)..."
-    docker exec $CONTAINER_NAME pg_dump -U $DB_USER $DB_NAME \
-        -t 'audit_logs' \
-        --where="id >= $THRESHOLD_ID" \
-        | gzip -9 > "$BACKUP_PATH"
-
-    # 3. STEP 2: Sync to Server B (Includes automatic remote directory creation)
-    echo "Syncing snapshot to Remote Server ($REMOTE_HOST)..."
-    rsync -avz --rsync-path="mkdir -p $REMOTE_DIR && rsync" "$BACKUP_PATH" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/"
-    
-    if [ $? -eq 0 ]; then
-        echo "Snapshot safe on Server B."
-        
-        # 4. STEP 3: DESTROY THE OLD DATA
-        echo "Permanently deleting all logs older than ID $THRESHOLD_ID..."
-        docker exec $CONTAINER_NAME psql -U $DB_USER -d $DB_NAME -c "DELETE FROM audit_logs WHERE id < $THRESHOLD_ID; VACUUM audit_logs;"
-        
-        echo "Cleanup complete. Only the latest 100,000 rows remain."
-        rm "$BACKUP_PATH"
-    else
-        echo "CRITICAL ERROR: Snapshot sync failed. Skipping deletion for safety."
-    fi
-else
-    echo "Table has fewer than 100,000 rows. No action needed."
+if [ $EXIT_CODE -ne 0 ] || ! [[ "$MAX_ID" =~ ^[0-9]+$ ]]; then
+    echo "CRITICAL ERROR: Could not get a valid Max ID. Aborting."
+    exit 1
 fi
 
-echo "PROCESS FINISHED: $(date)"
+THRESHOLD_ID=$((MAX_ID - KEEP_ROWS))
+
+if [ "$THRESHOLD_ID" -le 0 ]; then
+    echo "Current total rows is less than $KEEP_ROWS. No action needed."
+    exit 0
+fi
+
+set -e 
+echo "Retention Goal: Keep latest $KEEP_ROWS rows (IDs >= $THRESHOLD_ID)."
+
+# 2. CREATE SNAPSHOT (Postgres 14 Workaround)
+echo "Staging rows into $TEMP_TABLE..."
+docker exec -e PGPASSWORD="$DB_PASS" $CONTAINER_NAME psql -U $DB_USER -d $DB_NAME -c \
+    "DROP TABLE IF EXISTS $TEMP_TABLE; CREATE TABLE $TEMP_TABLE AS SELECT * FROM $TABLE_NAME WHERE id >= $THRESHOLD_ID;"
+
+# 3. EXPORT SNAPSHOT
+echo "Exporting snapshot to SQL format..."
+docker exec -e PGPASSWORD="$DB_PASS" $CONTAINER_NAME pg_dump -U $DB_USER $DB_NAME \
+    -t "$TEMP_TABLE" \
+    --clean --if-exists \
+    | gzip -9 > "$BACKUP_PATH"
+
+# 4. SYNC TO REMOTE SERVER
+echo "Syncing backup to Remote Server ($REMOTE_HOST)..."
+rsync -avz --timeout=30 --rsync-path="mkdir -p $REMOTE_DIR && rsync" "$BACKUP_PATH" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/"
+
+# 5. PURGE ORIGINAL TABLE
+echo "Transfer successful. Trimming $TABLE_NAME..."
+docker exec -e PGPASSWORD="$DB_PASS" $CONTAINER_NAME psql -U $DB_USER -d $DB_NAME -c "DELETE FROM $TABLE_NAME WHERE id < $THRESHOLD_ID;"
+
+# 6. RECLAIM SPACE (Standard Vacuum)
+echo "Running standard VACUUM (safe for live traffic)..."
+docker exec -e PGPASSWORD="$DB_PASS" $CONTAINER_NAME psql -U $DB_USER -d $DB_NAME -c "VACUUM $TABLE_NAME;"
+
+# 7. REMOTE RETENTION POLICY (Count-based)
+echo "Applying remote retention: Keeping only the latest $KEEP_BACKUPS files..."
+# Sort oldest first, remove everything except the last $KEEP_BACKUPS
+ssh "$REMOTE_USER@$REMOTE_HOST" "ls -1tr $REMOTE_DIR/audit_recent_*.sql.gz | head -n -$KEEP_BACKUPS | xargs -r rm --"
+
+echo "PROCESS SUCCESSFUL: $(date)"
 echo "-----------------------------------------------------"
