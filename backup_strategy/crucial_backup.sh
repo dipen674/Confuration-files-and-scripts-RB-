@@ -8,6 +8,7 @@ DB_NAME="mydatabase"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="/home/vagrant/logs/crucial_backup.log"
 BACKUP_PATH="/home/vagrant/backups/crucial_metadata_$TIMESTAMP.sql.gz"
+TABLE_NAME="audit_logs" # The table to EXCLUDE
 
 # REMOTE INFO
 REMOTE_USER="vagrant"
@@ -40,14 +41,12 @@ if ! docker ps --format '{{.Names}}' | grep -q "^$CONTAINER_NAME$"; then
 fi
 
 # 2. SQL Export (Users & Orders)
-echo "Step 1: Exporting 'users' and 'orders' tables..."
+echo "Step 1: Exporting database (Excluding $TABLE_NAME)..."
 if docker exec -e PGPASSWORD="$DB_PASS" $CONTAINER_NAME pg_dump -U $DB_USER $DB_NAME \
-    -t 'users' -t 'orders' \
+    -T "$TABLE_NAME" \
     --clean --if-exists \
     | gzip -9 > "$BACKUP_PATH"; then
-    
-    FILE_SIZE=$(du -h "$BACKUP_PATH" | cut -f1)
-    echo "Export successful. File size: $FILE_SIZE"
+    echo "Export successful. Size: $(du -h "$BACKUP_PATH" | cut -f1)"
 else
     echo "CRITICAL ERROR: pg_dump failed."
     exit 1
